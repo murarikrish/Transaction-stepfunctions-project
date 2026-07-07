@@ -1,4 +1,4 @@
 transaction_id,customer_id,amount,type,date
 T001,C001,1200,debit,2026-07-06
 T002,C002,4500,credit,2026-07-06
-T003,C001,300,debit,2026-07-06
+T003,C001,300,debit,2026-07-09
