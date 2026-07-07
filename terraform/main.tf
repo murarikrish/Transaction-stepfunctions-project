@@ -4,13 +4,87 @@ provider "aws" {
 
 variable "bucket_name" {}
 variable "image_uri" {}
-variable "ec2_instance_id" {
-  default = "i-0409e65e467933834"
+
+data "aws_caller_identity" "current" {}
+
+data "aws_vpc" "default" {
+  default = true
+}
+
+data "aws_subnets" "default" {
+  filter {
+    name   = "vpc-id"
+    values = [data.aws_vpc.default.id]
+  }
+}
+
+data "aws_ami" "amazon_linux_2023" {
+  most_recent = true
+  owners      = ["amazon"]
+
+  filter {
+    name   = "name"
+    values = ["al2023-ami-*-x86_64"]
+  }
+}
+
+resource "aws_security_group" "app_sg" {
+  name        = "transaction-project-sg"
+  description = "Security group for EC2 and ECS"
+  vpc_id      = data.aws_vpc.default.id
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    Name = "transaction-project-sg"
+  }
 }
 
 resource "aws_cloudwatch_log_group" "ecs_logs" {
   name              = "/ecs/transaction-processor"
   retention_in_days = 7
+}
+
+resource "aws_iam_role" "ec2_ssm_role" {
+  name = "github-created-ec2-ssm-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Principal = {
+        Service = "ec2.amazonaws.com"
+      }
+      Action = "sts:AssumeRole"
+    }]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "ec2_ssm_attach" {
+  role       = aws_iam_role.ec2_ssm_role.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+}
+
+resource "aws_iam_instance_profile" "ec2_profile" {
+  name = "github-created-ec2-instance-profile"
+  role = aws_iam_role.ec2_ssm_role.name
+}
+
+resource "aws_instance" "preprocess" {
+  ami                    = data.aws_ami.amazon_linux_2023.id
+  instance_type          = "t3.micro"
+  subnet_id              = data.aws_subnets.default.ids[0]
+  iam_instance_profile   = aws_iam_instance_profile.ec2_profile.name
+  vpc_security_group_ids = [aws_security_group.app_sg.id]
+
+  tags = {
+    Name = "github-created-preprocessing-ec2"
+  }
 }
 
 resource "aws_ecs_cluster" "main" {
@@ -106,30 +180,6 @@ resource "aws_ecs_task_definition" "task" {
   ])
 }
 
-data "aws_vpc" "default" {
-  default = true
-}
-
-data "aws_subnets" "default" {
-  filter {
-    name   = "vpc-id"
-    values = [data.aws_vpc.default.id]
-  }
-}
-
-resource "aws_security_group" "ecs_sg" {
-  name        = "ecs-transaction-sg"
-  description = "Security group for ECS transaction task"
-  vpc_id      = data.aws_vpc.default.id
-
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-}
-
 resource "aws_iam_role" "stepfunctions_role" {
   name = "stepfunctions-ecs-ec2-role"
 
@@ -195,15 +245,16 @@ resource "aws_sfn_state_machine" "transaction_workflow" {
   role_arn = aws_iam_role.stepfunctions_role.arn
 
   definition = jsonencode({
-    Comment = "Transaction processing workflow with EC2 validation and ECS task"
+    Comment = "Transaction processing workflow with GitHub-created EC2 and ECS task"
     StartAt = "CheckEC2Instance"
 
     States = {
       CheckEC2Instance = {
-        Type     = "Task"
-        Resource = "arn:aws:states:::aws-sdk:ec2:describeInstances"
+        Type       = "Task"
+        Resource   = "arn:aws:states:::aws-sdk:ec2:describeInstances"
+        ResultPath = "$.EC2Check"
         Parameters = {
-          InstanceIds = [var.ec2_instance_id]
+          InstanceIds = [aws_instance.preprocess.id]
         }
         Next = "IsEC2Running"
       }
@@ -212,12 +263,12 @@ resource "aws_sfn_state_machine" "transaction_workflow" {
         Type = "Choice"
         Choices = [
           {
-            Variable     = "$.Reservations[0].Instances[0].State.Name"
+            Variable     = "$.EC2Check.Reservations[0].Instances[0].State.Name"
             StringEquals = "running"
             Next         = "RunTransactionTask"
           },
           {
-            Variable     = "$.Reservations[0].Instances[0].State.Name"
+            Variable     = "$.EC2Check.Reservations[0].Instances[0].State.Name"
             StringEquals = "stopped"
             Next         = "StartEC2Instance"
           }
@@ -226,10 +277,11 @@ resource "aws_sfn_state_machine" "transaction_workflow" {
       }
 
       StartEC2Instance = {
-        Type     = "Task"
-        Resource = "arn:aws:states:::aws-sdk:ec2:startInstances"
+        Type       = "Task"
+        Resource   = "arn:aws:states:::aws-sdk:ec2:startInstances"
+        ResultPath = "$.EC2Start"
         Parameters = {
-          InstanceIds = [var.ec2_instance_id]
+          InstanceIds = [aws_instance.preprocess.id]
         }
         Next = "WaitForEC2"
       }
@@ -241,10 +293,11 @@ resource "aws_sfn_state_machine" "transaction_workflow" {
       }
 
       ValidateEC2Running = {
-        Type     = "Task"
-        Resource = "arn:aws:states:::aws-sdk:ec2:describeInstances"
+        Type       = "Task"
+        Resource   = "arn:aws:states:::aws-sdk:ec2:describeInstances"
+        ResultPath = "$.EC2Validation"
         Parameters = {
-          InstanceIds = [var.ec2_instance_id]
+          InstanceIds = [aws_instance.preprocess.id]
         }
         Next = "IsEC2Ready"
       }
@@ -253,7 +306,7 @@ resource "aws_sfn_state_machine" "transaction_workflow" {
         Type = "Choice"
         Choices = [
           {
-            Variable     = "$.Reservations[0].Instances[0].State.Name"
+            Variable     = "$.EC2Validation.Reservations[0].Instances[0].State.Name"
             StringEquals = "running"
             Next         = "RunTransactionTask"
           }
@@ -264,6 +317,7 @@ resource "aws_sfn_state_machine" "transaction_workflow" {
       RunTransactionTask = {
         Type     = "Task"
         Resource = "arn:aws:states:::ecs:runTask.sync"
+
         Parameters = {
           Cluster        = aws_ecs_cluster.main.arn
           TaskDefinition = aws_ecs_task_definition.task.arn
@@ -272,11 +326,12 @@ resource "aws_sfn_state_machine" "transaction_workflow" {
           NetworkConfiguration = {
             AwsvpcConfiguration = {
               Subnets        = data.aws_subnets.default.ids
-              SecurityGroups = [aws_security_group.ecs_sg.id]
+              SecurityGroups = [aws_security_group.app_sg.id]
               AssignPublicIp = "ENABLED"
             }
           }
         }
+
         End = true
       }
 
@@ -287,6 +342,10 @@ resource "aws_sfn_state_machine" "transaction_workflow" {
       }
     }
   })
+}
+
+output "created_ec2_instance_id" {
+  value = aws_instance.preprocess.id
 }
 
 output "ecs_cluster_name" {
