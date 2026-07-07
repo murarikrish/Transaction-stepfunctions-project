@@ -1,1 +1,37 @@
+name: Process Transaction CSV
 
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "transaction.csv"
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  process-transaction:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials using GitHub OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::408945636862:role/GitHubTerraformDeployRole
+          aws-region: ap-south-1
+
+      - name: Upload changed transaction.csv to S3
+        run: |
+          aws s3 cp transaction.csv s3://transaction-bucket-408945636862/input/transaction.csv
+
+      - name: Start Step Function automatically
+        run: |
+          aws stepfunctions start-execution \
+            --state-machine-arn arn:aws:states:ap-south-1:408945636862:stateMachine:transaction-processing-workflow \
+            --name transaction-github-${{ github.run_id }} \
+            --input '{}'
